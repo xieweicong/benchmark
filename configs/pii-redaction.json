@@ -1,0 +1,53 @@
+{
+  "suite": "pii-redaction",
+  "description": "Portable benchmark for local PII redaction systems.",
+  "dataset": "datasets/pii_multilang.jsonl",
+  "speed_sizes": [256, 1024, 4096],
+  "repeats": 3,
+  "warmup_repeats": 1,
+  "decode_new_tokens": 64,
+  "timeout_s": 600,
+  "warmup_text": "warmup: Jane Smith jane.smith@example.com +1 (415) 555-0199 sk-proj-example1234567890",
+  "models": [
+    {
+      "name": "regex",
+      "type": "regex",
+      "enabled": true,
+      "cost_per_hour_usd": 0
+    },
+    {
+      "name": "opf",
+      "type": "opf",
+      "enabled": true,
+      "categories": [
+        "secret",
+        "account_number",
+        "private_email",
+        "private_phone",
+        "private_person",
+        "private_address",
+        "private_date",
+        "private_url"
+      ]
+    },
+    {
+      "name": "qwen3-0.8b",
+      "type": "hf_causal_lm",
+      "enabled": false,
+      "model_id": "Qwen/Qwen3.5-0.8B",
+      "torch_dtype": "auto",
+      "quality_max_new_tokens": 512,
+      "timeout_s": 1200
+    },
+    {
+      "name": "qwen3-1.7b",
+      "type": "hf_causal_lm",
+      "enabled": false,
+      "model_id": "Qwen/Qwen3-1.7B",
+      "torch_dtype": "auto",
+      "quality_max_new_tokens": 768,
+      "timeout_s": 1800
+    }
+  ]
+}
+

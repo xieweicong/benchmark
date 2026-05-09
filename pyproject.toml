@@ -1,0 +1,34 @@
+[project]
+name = "pii-local-benchmark"
+version = "0.1.0"
+description = "Portable benchmark harness for local PII redaction models across CPU, Apple Silicon, and cloud GPUs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+hf = [
+    "torch>=2.2",
+    "transformers>=4.40",
+    "accelerate>=0.29",
+]
+opf = [
+    "opf @ git+https://github.com/openai/privacy-filter.git",
+]
+system = [
+    "psutil>=5.9",
+]
+yaml = [
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+pii-bench = "pii_benchmark.cli:main"
+
+[tool.setuptools]
+packages = ["pii_benchmark"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
