@@ -7,6 +7,8 @@ Portable benchmark harness for local PII redaction models. It is designed to run
 - Hardware and software metadata: OS, Python, CPU, RAM, GPU, CUDA/MPS, package versions, git commit.
 - Jetson metadata when present: L4T release, device-tree model, `nvpmodel`, and a `tegrastats` snapshot.
 - Speed: load time, warm latency, p50/p95 latency, input tokens/sec, and HF prefill/decode tokens/sec when available.
+- OPF stage breakdown: tokenization, tensor prep, model forward, logprob/copy, decode, span post-processing, and redaction time.
+- Scaling estimate: a rough fit of fixed overhead plus per-token latency across token buckets.
 - Efficiency: optional power budget and tokens/sec/watt for local deployment comparisons.
 - Quality: recall against synthetic multilingual PII samples plus anchor preservation to catch over-redaction or paraphrasing.
 
@@ -141,6 +143,9 @@ Run OPF. On Kaggle, the system runner auto-installs missing OPF dependencies int
 ./run.sh opf
 ```
 
+Current Kaggle PyTorch images may not support very old NVIDIA GPUs such as P100 (`sm_60`).
+Use T4 or newer for CUDA runs, or set `DEVICE=cpu` if you intentionally want a CPU baseline.
+
 The benchmark downloads OPF checkpoints itself when needed, avoiding a known incompatibility in OPF's default downloader on some notebook images. By default it reuses `~/.opf/privacy_filter` if valid, otherwise it caches under:
 
 ```text
@@ -221,11 +226,18 @@ pii-bench run --models regex --sizes 128,512
 Each JSONL file contains:
 
 - one `run_metadata` row
+- one `warmup` row per model, when warmup is enabled
 - one `speed` row per model and bucket
 - one `quality` row per model
 - optional `model_error` rows when a dependency, model download, OOM, or timeout fails
 
 JSONL is the source of truth. Markdown and CSV are generated views.
+
+For OPF runs, the Markdown report also includes:
+
+- `Warmup`: the first measured call after adapter load, useful for lazy load and cache setup.
+- `Stage Breakdown`: measured time inside the OPF call, synchronized around GPU/MPS model work.
+- `Scaling Estimate`: a fitted `latency = fixed_overhead + per_token_time * tokens` diagnostic. Treat this as a shape-of-curve clue; the stage table is the better place to see what the overhead actually is.
 
 ## Config
 

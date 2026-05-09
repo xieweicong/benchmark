@@ -10,6 +10,19 @@ from typing import Any
 from .hardware import hardware_label
 
 
+OPF_STAGE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("opf_component_s", "Components ms"),
+    ("opf_tokenize_s", "Tokenize ms"),
+    ("opf_window_prepare_s", "Tensor ms"),
+    ("opf_model_forward_s", "Forward ms"),
+    ("opf_logprob_transfer_s", "Logprob/copy ms"),
+    ("opf_aggregation_s", "Aggregate ms"),
+    ("opf_decode_s", "Decode ms"),
+    ("opf_span_postprocess_s", "Span ms"),
+    ("opf_redaction_s", "Redact ms"),
+)
+
+
 def load_rows(paths: list[str | Path]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for raw_path in paths:
@@ -30,6 +43,7 @@ def write_markdown(rows: list[dict[str, Any]], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = [row for row in rows if row.get("kind") == "run_metadata"]
+    warmup_rows = [row for row in rows if row.get("kind") == "warmup"]
     speed_rows = [row for row in rows if row.get("kind") == "speed"]
     quality_rows = [row for row in rows if row.get("kind") == "quality"]
     errors = [row for row in rows if row.get("kind") == "model_error"]
@@ -54,6 +68,29 @@ def write_markdown(rows: list[dict[str, Any]], path: str | Path) -> None:
             )
         lines.append("")
 
+    if warmup_rows:
+        lines.append("## Warmup")
+        lines.append("")
+        lines.append(
+            "First measured call after adapter load. Useful for lazy model load and kernel/cache setup."
+        )
+        lines.append("")
+        lines.append(
+            "| Model | Type | Repeats | Load s | Warmup p50 s | Input tok/s | Forward ms | Windows |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for row in warmup_rows:
+            agg = row.get("aggregate", {})
+            load = row.get("load", {})
+            lines.append(
+                f"| {row.get('model')} | {row.get('model_type')} | {row.get('repeats')} | "
+                f"{_fmt(load.get('load_s'))} | {_fmt(agg.get('latency_s_p50'))} | "
+                f"{_fmt(agg.get('input_tps_mean'))} | "
+                f"{_fmt_ms(agg.get('opf_model_forward_s_mean'))} | "
+                f"{_fmt(agg.get('opf_windows_mean'))} |"
+            )
+        lines.append("")
+
     if speed_rows:
         lines.append("## Speed")
         lines.append("")
@@ -72,6 +109,37 @@ def write_markdown(rows: list[dict[str, Any]], path: str | Path) -> None:
                 f"{_fmt(agg.get('prefill_tps_mean'))} | {_fmt(agg.get('decode_tps_mean'))} |"
             )
         lines.append("")
+
+        stage_rows = _stage_breakdowns(speed_rows)
+        if stage_rows:
+            lines.append("## Stage Breakdown")
+            lines.append("")
+            lines.append(
+                "Measured inside the OPF call with GPU/MPS synchronization around model work."
+            )
+            lines.append("")
+            lines.append(
+                "| Model | Bucket tok | Latency s | Components ms | Tokenize ms | Tensor ms | "
+                "Forward ms | Logprob/copy ms | Aggregate ms | Decode ms | Span ms | "
+                "Redact ms | Other ms | Windows |"
+            )
+            lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+            for item in stage_rows:
+                lines.append(
+                    f"| {item.get('model')} | {item.get('bucket_tokens')} | "
+                    f"{_fmt(item.get('latency_s'))} | "
+                    f"{_fmt_ms(item.get('opf_component_s'))} | "
+                    f"{_fmt_ms(item.get('opf_tokenize_s'))} | "
+                    f"{_fmt_ms(item.get('opf_window_prepare_s'))} | "
+                    f"{_fmt_ms(item.get('opf_model_forward_s'))} | "
+                    f"{_fmt_ms(item.get('opf_logprob_transfer_s'))} | "
+                    f"{_fmt_ms(item.get('opf_aggregation_s'))} | "
+                    f"{_fmt_ms(item.get('opf_decode_s'))} | "
+                    f"{_fmt_ms(item.get('opf_span_postprocess_s'))} | "
+                    f"{_fmt_ms(item.get('opf_redaction_s'))} | "
+                    f"{_fmt_ms(item.get('other_s'))} | {_fmt(item.get('opf_windows'))} |"
+                )
+            lines.append("")
 
         scaling = _scaling_estimates(speed_rows)
         if scaling:
@@ -149,7 +217,7 @@ def write_csv(rows: list[dict[str, Any]], path: str | Path) -> None:
     flat_rows: list[dict[str, Any]] = []
     for row in rows:
         kind = row.get("kind")
-        if kind == "speed":
+        if kind in {"speed", "warmup"}:
             agg = row.get("aggregate", {})
             flat_rows.append({
                 "kind": kind,
@@ -160,6 +228,7 @@ def write_csv(rows: list[dict[str, Any]], path: str | Path) -> None:
                 "bucket_tokens": row.get("bucket_tokens"),
                 "successful_repeats": row.get("successful_repeats"),
                 "repeats": row.get("repeats"),
+                "load_s": row.get("load", {}).get("load_s"),
                 "latency_s_p50": agg.get("latency_s_p50"),
                 "latency_s_p95": agg.get("latency_s_p95"),
                 "input_tps_mean": agg.get("input_tps_mean"),
@@ -170,6 +239,7 @@ def write_csv(rows: list[dict[str, Any]], path: str | Path) -> None:
                 "decode_tps_mean": agg.get("decode_tps_mean"),
                 "decode_tps_per_watt": agg.get("decode_tps_per_watt"),
             })
+            _add_stage_columns(flat_rows[-1], row)
         elif kind == "quality":
             flat_rows.append({
                 "kind": kind,
@@ -229,6 +299,61 @@ def _list(value: Any) -> str:
     if isinstance(value, list):
         return "<br>".join(str(item).replace("|", "/") for item in value)
     return str(value).replace("|", "/")
+
+
+def _fmt_ms(value: Any) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value) * 1000.0:.1f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _measurement_values(row: dict[str, Any], key: str) -> list[float]:
+    values: list[float] = []
+    for measurement in row.get("measurements", []):
+        value = measurement.get(key)
+        if _is_number(value):
+            values.append(float(value))
+    return values
+
+
+def _measurement_mean(row: dict[str, Any], key: str) -> float | None:
+    values = _measurement_values(row, key)
+    return sum(values) / len(values) if values else None
+
+
+def _add_stage_columns(target: dict[str, Any], row: dict[str, Any]) -> None:
+    for key, _label in OPF_STAGE_FIELDS:
+        target[f"{key}_mean"] = _measurement_mean(row, key)
+    target["opf_windows_mean"] = _measurement_mean(row, "opf_windows")
+    target["opf_window_tokens_mean"] = _measurement_mean(row, "opf_window_tokens")
+
+
+def _stage_breakdowns(speed_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in speed_rows:
+        if not any(_measurement_values(row, key) for key, _label in OPF_STAGE_FIELDS):
+            continue
+        item: dict[str, Any] = {
+            "run_id": row.get("run_id"),
+            "model": row.get("model"),
+            "model_type": row.get("model_type"),
+            "bucket_tokens": row.get("bucket_tokens"),
+            "latency_s": _measurement_mean(row, "latency_s"),
+            "opf_windows": _measurement_mean(row, "opf_windows"),
+        }
+        accounted = 0.0
+        for key, _label in OPF_STAGE_FIELDS:
+            value = _measurement_mean(row, key)
+            item[key] = value
+            if value is not None:
+                accounted += value
+        latency = item.get("latency_s")
+        item["other_s"] = max(float(latency) - accounted, 0.0) if _is_number(latency) else None
+        rows.append(item)
+    return rows
 
 
 def _scaling_estimates(speed_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

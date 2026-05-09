@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import os
 import re
 import shutil
@@ -134,6 +135,8 @@ class OPFAdapter(ModelAdapter):
     def __init__(self, config: dict[str, Any], device: str = "auto") -> None:
         super().__init__(config, device)
         self._opf: Any = None
+        self._torch: Any = None
+        self.resolved_device = "cpu"
         self.categories = set(config.get("categories") or PII_CATEGORIES)
 
     def _pick_device(self) -> str:
@@ -143,7 +146,9 @@ class OPFAdapter(ModelAdapter):
             import torch  # type: ignore
         except Exception:
             return "cpu"
+        self._torch = torch
         if torch.cuda.is_available():
+            _raise_if_cuda_unsupported(torch)
             return "cuda"
         if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
             return "mps"
@@ -157,6 +162,7 @@ class OPFAdapter(ModelAdapter):
             raise RuntimeError("OPF adapter requires `pip install .[opf]`.") from exc
 
         device = self._pick_device()
+        self.resolved_device = device
         if device == "mps":
             os.environ.setdefault("OPF_MOE_TRITON", "0")
         checkpoint = self.config.get("checkpoint")
@@ -176,6 +182,12 @@ class OPFAdapter(ModelAdapter):
     def redact(self, text: str) -> RedactionOutput:
         if self._opf is None:
             self.load()
+        try:
+            return self._redact_timed(text)
+        except (ImportError, AttributeError):
+            return self._redact_public(text)
+
+    def _redact_public(self, text: str) -> RedactionOutput:
         started = time.perf_counter()
         result = self._opf.redact(text)
         if isinstance(result, str):
@@ -193,6 +205,235 @@ class OPFAdapter(ModelAdapter):
             input_tokens=token_count(text),
             output_tokens=token_count(redacted),
             metrics={"latency_s": latency, "spans": len(spans)},
+        )
+
+    def _sync(self) -> None:
+        if self._torch is None:
+            return
+        if self.resolved_device == "cuda" and self._torch.cuda.is_available():
+            self._torch.cuda.synchronize()
+        elif (
+            self.resolved_device == "mps"
+            and getattr(self._torch, "mps", None) is not None
+        ):
+            self._torch.mps.synchronize()
+
+    def _redact_timed(self, text: str) -> RedactionOutput:
+        import torch  # type: ignore
+        import torch.nn.functional as F  # type: ignore
+        from opf._core import runtime as opf_runtime  # type: ignore
+
+        if self._torch is None:
+            self._torch = torch
+
+        metrics: dict[str, Any] = {
+            "opf_component_s": 0.0,
+            "opf_tokenize_s": 0.0,
+            "opf_window_prepare_s": 0.0,
+            "opf_model_forward_s": 0.0,
+            "opf_logprob_transfer_s": 0.0,
+            "opf_aggregation_s": 0.0,
+            "opf_decode_s": 0.0,
+            "opf_span_postprocess_s": 0.0,
+            "opf_redaction_s": 0.0,
+            "opf_windows": 0,
+            "opf_window_tokens": 0,
+        }
+
+        with torch.inference_mode():
+            self._sync()
+            total_started = time.perf_counter()
+
+            stage_started = time.perf_counter()
+            runtime, decoder = self._opf.get_prediction_components()
+            self._sync()
+            metrics["opf_component_s"] = time.perf_counter() - stage_started
+
+            stage_started = time.perf_counter()
+            token_ids = tuple(
+                int(tok) for tok in runtime.encoding.encode(text, allowed_special="all")
+            )
+            metrics["opf_tokenize_s"] = time.perf_counter() - stage_started
+
+            if not token_ids:
+                metrics["latency_s"] = time.perf_counter() - total_started
+                metrics["spans"] = 0
+                return RedactionOutput(text=text, input_tokens=0, output_tokens=0, metrics=metrics)
+
+            example_id = "benchmark-example"
+            background = int(runtime.label_info.background_token_label)
+            example = opf_runtime.TokenizedExample(
+                tokens=token_ids,
+                labels=tuple(background for _ in token_ids),
+                example_id=example_id,
+                text=text,
+            )
+            aggregation = opf_runtime.ExampleAggregation(
+                logprob_logsumexp=[],
+                counts=[],
+                labels=[],
+                token_ids=[],
+            )
+
+            for window in opf_runtime.example_to_windows(example, runtime.n_ctx):
+                if not window.tokens:
+                    continue
+                metrics["opf_windows"] += 1
+                metrics["opf_window_tokens"] += len(window.tokens)
+
+                stage_started = time.perf_counter()
+                window_tokens = torch.tensor(
+                    [list(window.tokens)],
+                    device=runtime.device,
+                    dtype=torch.int32,
+                )
+                attention_mask = torch.ones_like(window_tokens, dtype=torch.bool)
+                self._sync()
+                metrics["opf_window_prepare_s"] += time.perf_counter() - stage_started
+
+                self._sync()
+                stage_started = time.perf_counter()
+                logits = runtime.model(window_tokens, attention_mask=attention_mask)
+                self._sync()
+                metrics["opf_model_forward_s"] += time.perf_counter() - stage_started
+
+                stage_started = time.perf_counter()
+                log_probs = F.log_softmax(logits.float(), dim=-1)[0].cpu()
+                self._sync()
+                metrics["opf_logprob_transfer_s"] += time.perf_counter() - stage_started
+                if log_probs.shape[0] != len(window.tokens):
+                    raise ValueError("Logprob output length does not match window length")
+
+                stage_started = time.perf_counter()
+                for token_pos, is_valid in enumerate(window.mask):
+                    if not bool(is_valid):
+                        continue
+                    token_idx = int(window.offsets[token_pos])
+                    if token_idx < 0:
+                        continue
+                    aggregation.ensure_capacity(token_idx)
+                    score_vec = log_probs[token_pos]
+                    existing = aggregation.logprob_logsumexp[token_idx]
+                    if existing is None:
+                        aggregation.logprob_logsumexp[token_idx] = score_vec.clone()
+                    else:
+                        aggregation.logprob_logsumexp[token_idx] = torch.logaddexp(
+                            existing,
+                            score_vec,
+                        )
+                    aggregation.counts[token_idx] += 1
+                    aggregation.record_token_id(
+                        token_idx,
+                        int(window.tokens[token_pos]),
+                        example_id,
+                    )
+                    aggregation.length = max(aggregation.length, token_idx + 1)
+                metrics["opf_aggregation_s"] += time.perf_counter() - stage_started
+
+            stage_started = time.perf_counter()
+            token_positions: list[int] = []
+            token_score_vectors: list[Any] = []
+            for token_idx in range(aggregation.length):
+                if token_idx >= len(aggregation.logprob_logsumexp):
+                    continue
+                score_sum = aggregation.logprob_logsumexp[token_idx]
+                count = aggregation.counts[token_idx]
+                if score_sum is None or count <= 0:
+                    continue
+                avg_logprob = score_sum - math.log(float(count))
+                token_positions.append(token_idx)
+                token_score_vectors.append(avg_logprob)
+
+            if not token_score_vectors:
+                metrics["opf_decode_s"] = time.perf_counter() - stage_started
+                metrics["latency_s"] = time.perf_counter() - total_started
+                metrics["spans"] = 0
+                return RedactionOutput(
+                    text=text,
+                    input_tokens=len(token_ids),
+                    output_tokens=token_count(text),
+                    metrics=metrics,
+                )
+
+            stacked_scores = torch.stack(token_score_vectors, dim=0)
+            if decoder is not None:
+                decoded_labels = decoder.decode(stacked_scores)
+                if len(decoded_labels) != len(token_positions):
+                    decoded_labels = stacked_scores.argmax(dim=1).tolist()
+            else:
+                decoded_labels = stacked_scores.argmax(dim=1).tolist()
+            predicted_labels_by_index = {
+                token_idx: int(label)
+                for token_idx, label in zip(token_positions, decoded_labels)
+            }
+            predicted_token_spans = opf_runtime.labels_to_spans(
+                predicted_labels_by_index,
+                runtime.label_info,
+            )
+            metrics["opf_decode_s"] = time.perf_counter() - stage_started
+
+            stage_started = time.perf_counter()
+            decoded_text, char_starts, char_ends = opf_runtime.decode_text_with_offsets(
+                token_ids,
+                runtime.encoding,
+            )
+            decoded_mismatch = decoded_text != text
+            source_text = decoded_text if decoded_mismatch else text
+            predicted_char_spans = opf_runtime.token_spans_to_char_spans(
+                predicted_token_spans,
+                char_starts,
+                char_ends,
+            )
+            if runtime.trim_span_whitespace:
+                predicted_char_spans = opf_runtime.trim_char_spans_whitespace(
+                    predicted_char_spans,
+                    source_text,
+                )
+            if runtime.discard_overlapping_predicted_spans:
+                predicted_char_spans = opf_runtime.discard_overlapping_spans_by_label(
+                    predicted_char_spans,
+                )
+
+            detected: list[Any] = []
+            for label_idx, start, end in predicted_char_spans:
+                if not (0 <= start < end <= len(source_text)):
+                    continue
+                label = (
+                    str(runtime.label_info.span_class_names[label_idx])
+                    if 0 <= int(label_idx) < len(runtime.label_info.span_class_names)
+                    else f"label_{label_idx}"
+                )
+                detected.append(
+                    opf_runtime.DetectedSpan(
+                        label=label,
+                        start=int(start),
+                        end=int(end),
+                        text=source_text[start:end],
+                        placeholder=opf_runtime._label_placeholder(label),
+                    )
+                )
+            display_spans = opf_runtime._apply_output_mode_to_detected_spans(
+                opf_runtime._select_non_overlapping_spans(detected),
+                output_mode=runtime.output_mode,
+            )
+            filtered_spans = [
+                span for span in display_spans
+                if getattr(span, "label", None) in self.categories
+            ]
+            metrics["opf_span_postprocess_s"] = time.perf_counter() - stage_started
+
+            stage_started = time.perf_counter()
+            redacted = _apply_spans(source_text, filtered_spans)
+            metrics["opf_redaction_s"] = time.perf_counter() - stage_started
+            metrics["latency_s"] = time.perf_counter() - total_started
+            metrics["spans"] = len(filtered_spans)
+            metrics["opf_decoded_mismatch"] = decoded_mismatch
+
+        return RedactionOutput(
+            text=redacted,
+            input_tokens=len(token_ids),
+            output_tokens=token_count(redacted),
+            metrics=metrics,
         )
 
 
@@ -234,6 +475,8 @@ class HFCausalLMAdapter(ModelAdapter):
 
         self.torch = torch
         self.resolved_device = self._pick_device()
+        if self.resolved_device == "cuda":
+            _raise_if_cuda_unsupported(self.torch)
         self.tok = AutoTokenizer.from_pretrained(self.model_id)
         kwargs: dict[str, Any] = {
             "torch_dtype": self._dtype(),
@@ -420,6 +663,26 @@ def _ensure_opf_checkpoint() -> Path:
     if not _valid_opf_checkpoint(path):
         raise RuntimeError(f"Downloaded OPF checkpoint is incomplete: {path}")
     return path
+
+
+def _raise_if_cuda_unsupported(torch: Any) -> None:
+    if not torch.cuda.is_available():
+        return
+    major, minor = torch.cuda.get_device_capability()
+    arch = f"sm_{major}{minor}"
+    supported = set(getattr(torch.cuda, "get_arch_list", lambda: [])())
+    if not supported or arch in supported or f"compute_{major}{minor}" in supported:
+        return
+
+    name = torch.cuda.get_device_name(0)
+    supported_text = ", ".join(sorted(supported)) or "unknown"
+    raise RuntimeError(
+        f"CUDA device {name} has capability {arch}, but this PyTorch build only supports "
+        f"{supported_text}. This usually means the GPU is too old for the installed "
+        "PyTorch/CUDA wheel. Use T4 or newer, install a PyTorch build compiled for "
+        f"{arch}, "
+        "or set DEVICE=cpu to benchmark CPU instead."
+    )
 
 
 def build_adapter(config: dict[str, Any], device: str = "auto") -> ModelAdapter:

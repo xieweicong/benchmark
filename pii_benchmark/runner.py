@@ -88,7 +88,7 @@ def _numeric_values(measurements: list[dict[str, Any]], key: str) -> list[float]
 
 def _aggregate(measurements: list[dict[str, Any]], power_watts: float | None = None) -> dict[str, Any]:
     aggregate: dict[str, Any] = {}
-    for key in (
+    core_keys = {
         "latency_s",
         "input_tps",
         "ttft_s",
@@ -96,7 +96,17 @@ def _aggregate(measurements: list[dict[str, Any]], power_watts: float | None = N
         "decode_tps",
         "short_e2e_tps",
         "peak_gpu_mem_mb",
-    ):
+    }
+    profiled_keys = {
+        key
+        for measurement in measurements
+        for key in measurement
+        if key.startswith("opf_")
+        and key not in {"opf_decoded_mismatch"}
+        and isinstance(measurement.get(key), int | float)
+        and not isinstance(measurement.get(key), bool)
+    }
+    for key in sorted(core_keys | profiled_keys):
         values = _numeric_values(measurements, key)
         if not values:
             continue
@@ -211,7 +221,19 @@ class BenchmarkRunner:
             with time_limit(_timeout_for(model_config, self.config)):
                 load_info = adapter.load()
             _log(f"[{adapter.name}] loaded: {load_info}")
-            self._warmup(adapter, model_config)
+            warmup_measurements = self._warmup(adapter, model_config)
+            if warmup_measurements:
+                _write_jsonl(self.out_path, {
+                    "schema_version": SCHEMA_VERSION,
+                    "kind": "warmup",
+                    "run_id": self.run_id,
+                    "model": adapter.name,
+                    "model_type": adapter.type,
+                    "repeats": len(warmup_measurements),
+                    "load": load_info,
+                    "measurements": warmup_measurements,
+                    "aggregate": _aggregate(warmup_measurements, power_watts),
+                })
             for bucket in self.speed_sizes:
                 self._run_speed_bucket(adapter, model_config, load_info, seed, bucket, power_watts)
             if self.run_quality:
@@ -232,13 +254,20 @@ class BenchmarkRunner:
         finally:
             adapter.close()
 
-    def _warmup(self, adapter: Any, model_config: dict[str, Any]) -> None:
+    def _warmup(self, adapter: Any, model_config: dict[str, Any]) -> list[dict[str, Any]]:
         warmup_text = str(self.config.get("warmup_text", "warmup: jane@example.com +1 415 555 0199"))
         warmup_repeats = int(model_config.get("warmup_repeats", self.config.get("warmup_repeats", 1)))
+        measurements: list[dict[str, Any]] = []
         for index in range(max(warmup_repeats, 0)):
             _log(f"[{adapter.name}] warmup {index + 1}/{warmup_repeats}...")
             with time_limit(_timeout_for(model_config, self.config)):
-                adapter.speed_once(warmup_text, int(self.config.get("decode_new_tokens", 32)))
+                measurement = adapter.speed_once(
+                    warmup_text,
+                    int(self.config.get("decode_new_tokens", 32)),
+                )
+            measurement["repeat_index"] = index
+            measurements.append(measurement)
+        return measurements
 
     def _run_speed_bucket(
         self,
