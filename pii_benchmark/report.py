@@ -45,6 +45,7 @@ def write_markdown(rows: list[dict[str, Any]], path: str | Path) -> None:
     metadata = [row for row in rows if row.get("kind") == "run_metadata"]
     warmup_rows = [row for row in rows if row.get("kind") == "warmup"]
     speed_rows = [row for row in rows if row.get("kind") == "speed"]
+    batch_rows = [row for row in rows if row.get("kind") == "batch_compare"]
     quality_rows = [row for row in rows if row.get("kind") == "quality"]
     errors = [row for row in rows if row.get("kind") == "model_error"]
 
@@ -164,6 +165,35 @@ def write_markdown(rows: list[dict[str, Any]], path: str | Path) -> None:
                 )
             lines.append("")
 
+    if batch_rows:
+        lines.append("## Batch Compare")
+        lines.append("")
+        lines.append(
+            "Compares many small requests against one concatenated long request with the same total token budget."
+        )
+        lines.append("")
+        for row in batch_rows:
+            serial_count = row.get("serial_count")
+            serial_chunk_tokens = row.get("serial_chunk_tokens")
+            serial_total_tokens = row.get("serial_total_tokens")
+            concat_tokens = row.get("concat_tokens")
+            serial_total_latency = row.get("serial_total_latency_s")
+            concat_latency = row.get("concat_latency_s")
+            lines.append(f"- Model `{row.get('model')}`")
+            lines.append(
+                f"  - Serial: `{serial_count} x {serial_chunk_tokens}` calls, "
+                f"about `{_fmt(serial_total_tokens)}` tokens total, "
+                f"{_fmt(serial_total_latency)} s, `{_fmt(row.get('serial_effective_tps'))}` tok/s"
+            )
+            lines.append(
+                f"  - Concat: `1 x {concat_tokens}` call, "
+                f"{_fmt(concat_latency)} s, `{_fmt(row.get('concat_input_tps'))}` tok/s"
+            )
+            lines.append(
+                f"  - Speedup from concatenation: `{_fmt(row.get('speedup_vs_serial'))}x`"
+            )
+        lines.append("")
+
     if quality_rows:
         lines.append("## Quality")
         lines.append("")
@@ -217,7 +247,7 @@ def write_csv(rows: list[dict[str, Any]], path: str | Path) -> None:
     flat_rows: list[dict[str, Any]] = []
     for row in rows:
         kind = row.get("kind")
-        if kind in {"speed", "warmup"}:
+        if kind in {"speed", "warmup", "batch_compare"}:
             agg = row.get("aggregate", {})
             flat_rows.append({
                 "kind": kind,
@@ -229,6 +259,15 @@ def write_csv(rows: list[dict[str, Any]], path: str | Path) -> None:
                 "successful_repeats": row.get("successful_repeats"),
                 "repeats": row.get("repeats"),
                 "load_s": row.get("load", {}).get("load_s"),
+                "serial_count": row.get("serial_count"),
+                "serial_chunk_tokens": row.get("serial_chunk_tokens"),
+                "serial_total_tokens": row.get("serial_total_tokens"),
+                "serial_total_latency_s": row.get("serial_total_latency_s"),
+                "serial_effective_tps": row.get("serial_effective_tps"),
+                "concat_tokens": row.get("concat_tokens"),
+                "concat_latency_s": row.get("concat_latency_s"),
+                "concat_input_tps": row.get("concat_input_tps"),
+                "speedup_vs_serial": row.get("speedup_vs_serial"),
                 "latency_s_p50": agg.get("latency_s_p50"),
                 "latency_s_p95": agg.get("latency_s_p95"),
                 "input_tps_mean": agg.get("input_tps_mean"),

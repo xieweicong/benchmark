@@ -9,6 +9,7 @@ Portable benchmark harness for local PII redaction models. It is designed to run
 - Speed: load time, warm latency, p50/p95 latency, input tokens/sec, and HF prefill/decode tokens/sec when available.
 - OPF stage breakdown: tokenization, tensor prep, model forward, logprob/copy, decode, span post-processing, and redaction time.
 - Scaling estimate: a rough fit of fixed overhead plus per-token latency across token buckets.
+- Batch compare: 100 independent 256-token calls versus one concatenated 25600-token call.
 - Efficiency: optional power budget and tokens/sec/watt for local deployment comparisons.
 - Quality: recall against synthetic multilingual PII samples plus anchor preservation to catch over-redaction or paraphrasing.
 
@@ -238,6 +239,7 @@ For OPF runs, the Markdown report also includes:
 - `Warmup`: the first measured call after adapter load, useful for lazy load and cache setup.
 - `Stage Breakdown`: measured time inside the OPF call, synchronized around GPU/MPS model work.
 - `Scaling Estimate`: a fitted `latency = fixed_overhead + per_token_time * tokens` diagnostic. Treat this as a shape-of-curve clue; the stage table is the better place to see what the overhead actually is.
+- `Batch Compare`: a direct serial-vs-concatenated throughput comparison for the same total token budget.
 
 ## Config
 

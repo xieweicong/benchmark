@@ -28,6 +28,11 @@ class ReportTests(unittest.TestCase):
                 '"measurements":[{"latency_s":0.2,"opf_model_forward_s":0.08,'
                 '"opf_tokenize_s":0.02,"opf_windows":1}],'
                 '"aggregate":{"latency_s_p50":0.2,"input_tps_mean":1000}}\n'
+                '{"kind":"batch_compare","run_id":"abc","model":"regex","model_type":"regex",'
+                '"serial_count":100,"serial_chunk_tokens":256,"serial_total_tokens":25600,'
+                '"serial_total_latency_s":10.0,"serial_effective_tps":2560,'
+                '"concat_tokens":25600,"concat_latency_s":2.0,"concat_input_tps":12800,'
+                '"speedup_vs_serial":5.0,"load":{"load_s":0.01}}\n'
                 '{"kind":"quality","run_id":"abc","model":"regex","model_type":"regex",'
                 '"sample_count":1,"successful_samples":1,"recall":0.5,"pii_hit":1,"pii_total":2,'
                 '"anchor_keep":0,"anchor_total":1,"anchor_keep_rate":0,"latency_s":0.1,'
@@ -42,5 +47,6 @@ class ReportTests(unittest.TestCase):
             self.assertIn("PII Redaction Benchmark Report", text)
             self.assertIn("Warmup", text)
             self.assertIn("Stage Breakdown", text)
+            self.assertIn("Batch Compare", text)
             self.assertIn("Scaling Estimate", text)
             self.assertIn("Quality Details", text)

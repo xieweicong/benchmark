@@ -5,6 +5,8 @@
   "speed_sizes": [256, 1024, 4096],
   "repeats": 3,
   "warmup_repeats": 1,
+  "batch_compare_count": 100,
+  "batch_compare_chunk_tokens": 256,
   "decode_new_tokens": 64,
   "timeout_s": 600,
   "warmup_text": "warmup: Jane Smith jane.smith@example.com +1 (415) 555-0199 sk-proj-example1234567890",
@@ -50,4 +52,3 @@
     }
   ]
 }
-

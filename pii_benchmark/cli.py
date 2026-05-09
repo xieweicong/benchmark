@@ -31,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_parser.add_argument("--quality-limit", type=int)
     run_parser.add_argument("--no-quality", action="store_true")
+    run_parser.add_argument("--no-batch-compare", action="store_true")
     run_parser.add_argument("--power-watts", type=float, help="Hardware power budget for tok/s/W.")
     run_parser.add_argument("--power-note", help="Free-form note for the power measurement or mode.")
     run_parser.add_argument("--out", help="JSONL output path.")
@@ -80,6 +81,7 @@ def _run(args: argparse.Namespace) -> int:
         repeats=config.get("repeats"),
         quality_limit=args.quality_limit,
         run_quality=not args.no_quality,
+        run_batch_compare=not args.no_batch_compare,
     )
     result_path = runner.run()
     rows = load_rows([result_path])

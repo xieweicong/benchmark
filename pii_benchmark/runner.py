@@ -157,6 +157,7 @@ class BenchmarkRunner:
         repeats: int | None = None,
         quality_limit: int | None = None,
         run_quality: bool = True,
+        run_batch_compare: bool = True,
     ) -> None:
         self.config = config
         self.models = models
@@ -167,6 +168,7 @@ class BenchmarkRunner:
         self.repeats = repeats or int(config.get("repeats", 3))
         self.quality_limit = quality_limit
         self.run_quality = run_quality
+        self.run_batch_compare = run_batch_compare
         self.run_id = uuid.uuid4().hex[:12]
 
     def run(self) -> Path:
@@ -236,6 +238,8 @@ class BenchmarkRunner:
                 })
             for bucket in self.speed_sizes:
                 self._run_speed_bucket(adapter, model_config, load_info, seed, bucket, power_watts)
+            if self.run_batch_compare:
+                self._run_batch_compare(adapter, model_config, load_info, seed, power_watts)
             if self.run_quality:
                 self._run_quality(adapter, model_config, load_info, samples)
             _log(f"[{adapter.name}] done.")
@@ -376,6 +380,89 @@ class BenchmarkRunner:
             "sample_scores": sample_scores,
             "load": load_info,
             "errors": errors,
+        })
+
+    def _run_batch_compare(
+        self,
+        adapter: Any,
+        model_config: dict[str, Any],
+        load_info: dict[str, Any],
+        seed: str,
+        power_watts: float | None,
+    ) -> None:
+        if self.run_batch_compare is False:
+            return
+
+        chunk_tokens = int(
+            model_config.get(
+                "batch_compare_chunk_tokens",
+                self.config.get("batch_compare_chunk_tokens", 256),
+            )
+        )
+        chunk_count = int(
+            model_config.get(
+                "batch_compare_count",
+                self.config.get("batch_compare_count", 100),
+            )
+        )
+        if chunk_tokens <= 0 or chunk_count <= 1:
+            return
+
+        serial_text = build_sized_text(seed, chunk_tokens)
+        concat_text = build_sized_text(seed, chunk_tokens * chunk_count)
+        serial_measurements: list[dict[str, Any]] = []
+
+        _log(
+            f"[{adapter.name}] batch-compare serial={chunk_count}x{chunk_tokens} "
+            f"concat={chunk_count * chunk_tokens}..."
+        )
+        for index in range(chunk_count):
+            with time_limit(_timeout_for(model_config, self.config)):
+                measurement = adapter.speed_once(
+                    serial_text,
+                    int(model_config.get("decode_new_tokens", self.config.get("decode_new_tokens", 64))),
+                )
+            measurement["repeat_index"] = index
+            serial_measurements.append(measurement)
+
+        concat_measurement: dict[str, Any]
+        with time_limit(_timeout_for(model_config, self.config)):
+            concat_measurement = adapter.speed_once(
+                concat_text,
+                int(model_config.get("decode_new_tokens", self.config.get("decode_new_tokens", 64))),
+            )
+
+        serial_total_latency = sum(
+            float(item.get("latency_s"))
+            for item in serial_measurements
+            if isinstance(item.get("latency_s"), int | float)
+        )
+        serial_total_tokens = sum(
+            int(item.get("input_tokens") or 0)
+            for item in serial_measurements
+        )
+        concat_latency = float(concat_measurement.get("latency_s") or 0.0)
+        concat_tokens = int(concat_measurement.get("input_tokens") or 0)
+
+        _write_jsonl(self.out_path, {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "batch_compare",
+            "run_id": self.run_id,
+            "model": adapter.name,
+            "model_type": adapter.type,
+            "serial_count": chunk_count,
+            "serial_chunk_tokens": chunk_tokens,
+            "serial_total_tokens": serial_total_tokens,
+            "serial_total_latency_s": serial_total_latency,
+            "serial_effective_tps": serial_total_tokens / serial_total_latency if serial_total_latency > 0 else None,
+            "serial_measurements": serial_measurements,
+            "concat_tokens": concat_tokens,
+            "concat_latency_s": concat_latency,
+            "concat_input_tps": float(concat_measurement.get("input_tps")) if isinstance(concat_measurement.get("input_tps"), int | float) else None,
+            "concat_measurement": concat_measurement,
+            "speedup_vs_serial": serial_total_latency / concat_latency if concat_latency > 0 else None,
+            "load": load_info,
+            "power_watts": power_watts,
         })
 
 
