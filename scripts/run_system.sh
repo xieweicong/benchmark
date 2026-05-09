@@ -16,6 +16,7 @@ DEVICE="${DEVICE:-auto}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 QUALITY_ARGS=()
 RUN_ARGS=()
+INSTALL_EXTRAS=""
 
 case "$MODE" in
   smoke)
@@ -28,6 +29,7 @@ case "$MODE" in
     MODELS="${MODELS:-opf}"
     SIZES="${SIZES:-256,1024,4096}"
     REPEATS="${REPEATS:-3}"
+    INSTALL_EXTRAS="opf,system"
     export OPF_MOE_TRITON="${OPF_MOE_TRITON:-0}"
     DEFAULT_OPF_CHECKPOINT="$HOME/Library/Application Support/PII Shield/model/privacy_filter"
     OPF_CHECKPOINT="${PII_BENCH_OPF_CHECKPOINT:-}"
@@ -43,11 +45,13 @@ case "$MODE" in
     SIZES="${SIZES:-256,1024}"
     REPEATS="${REPEATS:-3}"
     QUALITY_LIMIT="${QUALITY_LIMIT:-5}"
+    INSTALL_EXTRAS="hf,system"
     ;;
   all)
     MODELS="${MODELS:-regex,opf}"
     SIZES="${SIZES:-256,1024,4096}"
     REPEATS="${REPEATS:-3}"
+    INSTALL_EXTRAS="opf,hf,system"
     export OPF_MOE_TRITON="${OPF_MOE_TRITON:-0}"
     DEFAULT_OPF_CHECKPOINT="$HOME/Library/Application Support/PII Shield/model/privacy_filter"
     OPF_CHECKPOINT="${PII_BENCH_OPF_CHECKPOINT:-}"
@@ -70,6 +74,52 @@ if [[ -n "${QUALITY_LIMIT:-}" ]]; then
 fi
 
 OUT_BASE="results/${MODE}-system-${STAMP}"
+
+is_kaggle() {
+  [[ -d /kaggle || -n "${KAGGLE_URL_BASE:-}" || -n "${KAGGLE_KERNEL_RUN_TYPE:-}" ]]
+}
+
+module_available() {
+  "$PYTHON_BIN" - "$1" <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)
+PY
+}
+
+need_install() {
+  case "$MODE" in
+    opf)
+      module_available opf || return 0
+      ;;
+    hf)
+      module_available torch || return 0
+      module_available transformers || return 0
+      ;;
+    all)
+      module_available opf || return 0
+      module_available torch || return 0
+      module_available transformers || return 0
+      ;;
+  esac
+  return 1
+}
+
+AUTO_INSTALL="${PII_BENCH_AUTO_INSTALL:-}"
+if [[ -z "$AUTO_INSTALL" ]]; then
+  if is_kaggle; then
+    AUTO_INSTALL=1
+  else
+    AUTO_INSTALL=0
+  fi
+fi
+
+if [[ "$AUTO_INSTALL" == "1" || "$AUTO_INSTALL" == "true" ]]; then
+  if [[ -n "$INSTALL_EXTRAS" ]] && need_install; then
+    echo "Installing missing dependencies into system Python: .[$INSTALL_EXTRAS]"
+    "$PYTHON_BIN" -m pip install -e ".[$INSTALL_EXTRAS]"
+  fi
+fi
 
 echo "Running system mode=$MODE models=$MODELS sizes=$SIZES repeats=$REPEATS device=$DEVICE python=$PYTHON_BIN"
 if [[ -n "${PII_BENCH_POWER_WATTS:-}" ]]; then
@@ -98,4 +148,3 @@ echo "Done:"
 echo "  ${OUT_BASE}.jsonl"
 echo "  ${OUT_BASE}.md"
 echo "  ${OUT_BASE}.csv"
-

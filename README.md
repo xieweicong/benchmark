@@ -135,18 +135,22 @@ Smoke test:
 ./run.sh smoke
 ```
 
-Run OPF after installing the OPF dependency:
+Run OPF. On Kaggle, the system runner auto-installs missing OPF dependencies into the notebook Python:
 
 ```bash
-pip install -e ".[opf,system]"
 ./run.sh opf
 ```
 
-Run a Hugging Face baseline:
+Run a Hugging Face baseline. Missing `torch`/`transformers` dependencies are auto-installed on Kaggle when needed:
 
 ```bash
-pip install -e ".[hf,system]"
 ./run.sh hf qwen3-0.8b
+```
+
+Disable auto-install if you want to manage the environment yourself:
+
+```bash
+PII_BENCH_AUTO_INSTALL=0 ./run.sh opf
 ```
 
 If you ever see noisy notebook `sitecustomize` warnings from uv, force the system runner:
