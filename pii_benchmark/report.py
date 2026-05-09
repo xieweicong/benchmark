@@ -73,6 +73,29 @@ def write_markdown(rows: list[dict[str, Any]], path: str | Path) -> None:
             )
         lines.append("")
 
+        scaling = _scaling_estimates(speed_rows)
+        if scaling:
+            lines.append("## Scaling Estimate")
+            lines.append("")
+            lines.append(
+                "Fits `latency = fixed_overhead + per_token_time * tokens` from speed buckets. "
+                "Use this as a rough diagnostic, not a hardware spec."
+            )
+            lines.append("")
+            lines.append(
+                "| Run | Model | Type | Points | Fixed overhead s | Per-token ms | "
+                "Asymptotic tok/s | R^2 |"
+            )
+            lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+            for item in scaling:
+                lines.append(
+                    f"| `{item['run_id']}` | {item['model']} | {item['model_type']} | "
+                    f"{item['points']} | {_fmt(item['fixed_overhead_s'])} | "
+                    f"{_fmt(item['per_token_ms'])} | {_fmt(item['asymptotic_tps'])} | "
+                    f"{_fmt(item['r2'])} |"
+                )
+            lines.append("")
+
     if quality_rows:
         lines.append("## Quality")
         lines.append("")
@@ -162,6 +185,19 @@ def write_csv(rows: list[dict[str, Any]], path: str | Path) -> None:
                 "anchor_keep_rate": row.get("anchor_keep_rate"),
                 "latency_s": row.get("latency_s"),
             })
+    for item in _scaling_estimates([row for row in rows if row.get("kind") == "speed"]):
+        flat_rows.append({
+            "kind": "scaling_estimate",
+            "source": item.get("source"),
+            "run_id": item.get("run_id"),
+            "model": item.get("model"),
+            "model_type": item.get("model_type"),
+            "points": item.get("points"),
+            "fixed_overhead_s": item.get("fixed_overhead_s"),
+            "per_token_ms": item.get("per_token_ms"),
+            "asymptotic_tps": item.get("asymptotic_tps"),
+            "r2": item.get("r2"),
+        })
     fieldnames = sorted({key for row in flat_rows for key in row.keys()})
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -193,3 +229,66 @@ def _list(value: Any) -> str:
     if isinstance(value, list):
         return "<br>".join(str(item).replace("|", "/") for item in value)
     return str(value).replace("|", "/")
+
+
+def _scaling_estimates(speed_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str], list[tuple[float, float]]] = {}
+    meta: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for row in speed_rows:
+        agg = row.get("aggregate", {})
+        latency = agg.get("latency_s_p50")
+        tokens = row.get("bucket_tokens")
+        if not _is_number(latency) or not _is_number(tokens):
+            continue
+        if row.get("successful_repeats", 0) <= 0:
+            continue
+        key = (
+            str(row.get("_source") or ""),
+            str(row.get("run_id") or ""),
+            str(row.get("model") or ""),
+            str(row.get("model_type") or ""),
+        )
+        groups.setdefault(key, []).append((float(tokens), float(latency)))
+        meta[key] = {
+            "source": row.get("_source"),
+            "run_id": row.get("run_id"),
+            "model": row.get("model"),
+            "model_type": row.get("model_type"),
+        }
+
+    estimates: list[dict[str, Any]] = []
+    for key, points in groups.items():
+        unique = sorted(set(points))
+        if len(unique) < 2:
+            continue
+        xs = [point[0] for point in unique]
+        ys = [point[1] for point in unique]
+        x_mean = sum(xs) / len(xs)
+        y_mean = sum(ys) / len(ys)
+        denominator = sum((x - x_mean) ** 2 for x in xs)
+        if denominator <= 0:
+            continue
+        slope = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / denominator
+        intercept = y_mean - slope * x_mean
+        if slope <= 0:
+            continue
+
+        predicted = [intercept + slope * x for x in xs]
+        ss_res = sum((y - y_hat) ** 2 for y, y_hat in zip(ys, predicted))
+        ss_tot = sum((y - y_mean) ** 2 for y in ys)
+        r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else None
+
+        estimates.append({
+            **meta[key],
+            "points": len(unique),
+            "fixed_overhead_s": max(intercept, 0.0),
+            "raw_intercept_s": intercept,
+            "per_token_ms": slope * 1000.0,
+            "asymptotic_tps": 1.0 / slope,
+            "r2": r2,
+        })
+    return estimates
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)

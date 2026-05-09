@@ -15,6 +15,9 @@ class ReportTests(unittest.TestCase):
                 '{"kind":"speed","run_id":"abc","model":"regex","model_type":"regex",'
                 '"bucket_tokens":128,"successful_repeats":1,"repeats":1,'
                 '"aggregate":{"latency_s_p50":0.1,"input_tps_mean":1000}}\n'
+                '{"kind":"speed","run_id":"abc","model":"regex","model_type":"regex",'
+                '"bucket_tokens":256,"successful_repeats":1,"repeats":1,'
+                '"aggregate":{"latency_s_p50":0.2,"input_tps_mean":1000}}\n'
                 '{"kind":"quality","run_id":"abc","model":"regex","model_type":"regex",'
                 '"sample_count":1,"successful_samples":1,"recall":0.5,"pii_hit":1,"pii_total":2,'
                 '"anchor_keep":0,"anchor_total":1,"anchor_keep_rate":0,"latency_s":0.1,'
@@ -27,4 +30,5 @@ class ReportTests(unittest.TestCase):
             write_markdown(rows, out)
             text = out.read_text(encoding="utf-8")
             self.assertIn("PII Redaction Benchmark Report", text)
+            self.assertIn("Scaling Estimate", text)
             self.assertIn("Quality Details", text)
