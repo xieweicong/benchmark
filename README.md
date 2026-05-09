@@ -29,6 +29,7 @@ Force a runner when needed:
 
 ```bash
 PII_BENCH_RUNNER=local ./run.sh opf
+PII_BENCH_RUNNER=system ./run.sh opf
 PII_BENCH_RUNNER=docker-cuda ./run.sh opf
 PII_BENCH_RUNNER=jetson ./run.sh opf
 ```
@@ -123,6 +124,36 @@ Typical cloud flow:
 5. Use `python -m pii_benchmark.cli report` locally to merge them.
 
 The first version intentionally avoids cloud-provider orchestration. That keeps the run format stable before adding SSH runners, Docker images, or platform-specific launchers.
+
+## Kaggle / Notebook Workflow
+
+Kaggle usually has no Docker daemon and already has a Python/CUDA stack. In that environment, `./run.sh` auto-selects the system Python runner instead of creating a uv virtualenv.
+
+Smoke test:
+
+```bash
+./run.sh smoke
+```
+
+Run OPF after installing the OPF dependency:
+
+```bash
+pip install -e ".[opf,system]"
+./run.sh opf
+```
+
+Run a Hugging Face baseline:
+
+```bash
+pip install -e ".[hf,system]"
+./run.sh hf qwen3-0.8b
+```
+
+If you ever see noisy notebook `sitecustomize` warnings from uv, force the system runner:
+
+```bash
+PII_BENCH_RUNNER=system ./run.sh smoke
+```
 
 ## Jetson Workflow
 

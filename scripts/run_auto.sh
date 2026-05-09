@@ -27,11 +27,25 @@ has_cuda_server_stack() {
   return 0
 }
 
+is_kaggle() {
+  if [[ -d /kaggle ]]; then
+    return 0
+  fi
+  if [[ -n "${KAGGLE_URL_BASE:-}" || -n "${KAGGLE_KERNEL_RUN_TYPE:-}" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 case "$RUNNER" in
   auto)
     if is_jetson; then
       echo "Auto runner: Jetson/L4T detected."
       exec "$ROOT_DIR/scripts/run_jetson.sh" "$@"
+    fi
+    if is_kaggle; then
+      echo "Auto runner: Kaggle/notebook environment detected; using system Python runner."
+      exec "$ROOT_DIR/scripts/run_system.sh" "$@"
     fi
     if has_cuda_server_stack; then
       echo "Auto runner: Linux NVIDIA GPU + Docker detected."
@@ -43,6 +57,9 @@ case "$RUNNER" in
   local|uv)
     exec "$ROOT_DIR/scripts/run_local_uv.sh" "$@"
     ;;
+  system|notebook|kaggle)
+    exec "$ROOT_DIR/scripts/run_system.sh" "$@"
+    ;;
   docker|docker-cuda|cuda-docker)
     exec "$ROOT_DIR/scripts/run_docker_cuda.sh" "$@"
     ;;
@@ -51,8 +68,7 @@ case "$RUNNER" in
     ;;
   *)
     echo "Unknown PII_BENCH_RUNNER=$RUNNER" >&2
-    echo "Use one of: auto, local, docker-cuda, jetson" >&2
+    echo "Use one of: auto, local, system, docker-cuda, jetson" >&2
     exit 2
     ;;
 esac
-
