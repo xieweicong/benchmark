@@ -30,7 +30,6 @@ case "$MODE" in
     SIZES="${SIZES:-256,1024,4096}"
     REPEATS="${REPEATS:-3}"
     INSTALL_EXTRAS="opf,system"
-    export OPF_MOE_TRITON="${OPF_MOE_TRITON:-0}"
     DEFAULT_OPF_CHECKPOINT="$HOME/Library/Application Support/PII Shield/model/privacy_filter"
     OPF_CHECKPOINT="${PII_BENCH_OPF_CHECKPOINT:-}"
     if [[ -z "$OPF_CHECKPOINT" && -d "$DEFAULT_OPF_CHECKPOINT" ]]; then
@@ -52,7 +51,6 @@ case "$MODE" in
     SIZES="${SIZES:-256,1024,4096}"
     REPEATS="${REPEATS:-3}"
     INSTALL_EXTRAS="opf,hf,system"
-    export OPF_MOE_TRITON="${OPF_MOE_TRITON:-0}"
     DEFAULT_OPF_CHECKPOINT="$HOME/Library/Application Support/PII Shield/model/privacy_filter"
     OPF_CHECKPOINT="${PII_BENCH_OPF_CHECKPOINT:-}"
     if [[ -z "$OPF_CHECKPOINT" && -d "$DEFAULT_OPF_CHECKPOINT" ]]; then

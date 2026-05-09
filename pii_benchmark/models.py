@@ -5,8 +5,10 @@ from __future__ import annotations
 import gc
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .tokenize import token_count
@@ -159,6 +161,9 @@ class OPFAdapter(ModelAdapter):
             os.environ.setdefault("OPF_MOE_TRITON", "0")
         checkpoint = self.config.get("checkpoint")
         if checkpoint:
+            os.environ["OPF_CHECKPOINT"] = str(checkpoint)
+        elif os.environ.get("PII_BENCH_OPF_AUTO_DOWNLOAD", "1").lower() not in {"0", "false"}:
+            checkpoint = _ensure_opf_checkpoint()
             os.environ["OPF_CHECKPOINT"] = str(checkpoint)
         self._opf = OPF(
             device=device,
@@ -359,6 +364,64 @@ def _apply_spans(text: str, spans: list[Any]) -> str:
     return redacted
 
 
+def _valid_opf_checkpoint(path: Path) -> bool:
+    return (
+        path.is_dir()
+        and (path / "config.json").is_file()
+        and any(path.glob("*.safetensors"))
+    )
+
+
+def _promote_opf_original_subtree(path: Path) -> None:
+    original = path / "original"
+    if not original.is_dir():
+        return
+    for child in original.iterdir():
+        destination = path / child.name
+        if destination.exists():
+            continue
+        shutil.move(str(child), str(destination))
+    try:
+        original.rmdir()
+    except OSError:
+        pass
+
+
+def _ensure_opf_checkpoint() -> Path:
+    env_path = os.environ.get("OPF_CHECKPOINT")
+    if env_path:
+        path = Path(env_path).expanduser()
+        if _valid_opf_checkpoint(path):
+            return path
+
+    cache_dir = os.environ.get("PII_BENCH_OPF_CACHE_DIR")
+    default_path = Path.home() / ".opf/privacy_filter"
+    _promote_opf_original_subtree(default_path)
+    if _valid_opf_checkpoint(default_path):
+        return default_path
+
+    path = Path(cache_dir).expanduser() if cache_dir else Path.home() / ".cache/pii-benchmark/openai-privacy-filter"
+    _promote_opf_original_subtree(path)
+    if _valid_opf_checkpoint(path):
+        return path
+
+    try:
+        from huggingface_hub import snapshot_download  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("OPF checkpoint auto-download requires huggingface_hub.") from exc
+
+    print(f"[opf] downloading checkpoint to {path}...", flush=True)
+    snapshot_download(
+        repo_id="openai/privacy-filter",
+        local_dir=str(path),
+        allow_patterns=["original/*"],
+    )
+    _promote_opf_original_subtree(path)
+    if not _valid_opf_checkpoint(path):
+        raise RuntimeError(f"Downloaded OPF checkpoint is incomplete: {path}")
+    return path
+
+
 def build_adapter(config: dict[str, Any], device: str = "auto") -> ModelAdapter:
     adapter_type = str(config.get("type"))
     if adapter_type == "regex":
@@ -368,4 +431,3 @@ def build_adapter(config: dict[str, Any], device: str = "auto") -> ModelAdapter:
     if adapter_type == "hf_causal_lm":
         return HFCausalLMAdapter(config, device=device)
     raise ValueError(f"Unsupported model adapter type: {adapter_type}")
-

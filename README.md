@@ -141,6 +141,18 @@ Run OPF. On Kaggle, the system runner auto-installs missing OPF dependencies int
 ./run.sh opf
 ```
 
+The benchmark downloads OPF checkpoints itself when needed, avoiding a known incompatibility in OPF's default downloader on some notebook images. By default it reuses `~/.opf/privacy_filter` if valid, otherwise it caches under:
+
+```text
+~/.cache/pii-benchmark/openai-privacy-filter
+```
+
+Override the cache location when needed:
+
+```bash
+PII_BENCH_OPF_CACHE_DIR=/kaggle/working/opf-cache ./run.sh opf
+```
+
 Run a Hugging Face baseline. Missing `torch`/`transformers` dependencies are auto-installed on Kaggle when needed:
 
 ```bash
