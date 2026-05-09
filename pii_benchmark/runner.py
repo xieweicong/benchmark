@@ -55,6 +55,10 @@ def _write_jsonl(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _log(message: str) -> None:
+    print(message, flush=True)
+
+
 def _percentile(values: list[float], pct: float) -> float | None:
     if not values:
         return None
@@ -203,14 +207,18 @@ class BenchmarkRunner:
         adapter = build_adapter(model_config, device=str(model_config.get("device") or self.device))
         load_info: dict[str, Any] = {}
         try:
+            _log(f"[{adapter.name}] loading adapter ({adapter.type})...")
             with time_limit(_timeout_for(model_config, self.config)):
                 load_info = adapter.load()
+            _log(f"[{adapter.name}] loaded: {load_info}")
             self._warmup(adapter, model_config)
             for bucket in self.speed_sizes:
                 self._run_speed_bucket(adapter, model_config, load_info, seed, bucket, power_watts)
             if self.run_quality:
                 self._run_quality(adapter, model_config, load_info, samples)
+            _log(f"[{adapter.name}] done.")
         except Exception as exc:
+            _log(f"[{adapter.name}] error: {type(exc).__name__}: {exc}")
             _write_jsonl(self.out_path, {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "model_error",
@@ -227,7 +235,8 @@ class BenchmarkRunner:
     def _warmup(self, adapter: Any, model_config: dict[str, Any]) -> None:
         warmup_text = str(self.config.get("warmup_text", "warmup: jane@example.com +1 415 555 0199"))
         warmup_repeats = int(model_config.get("warmup_repeats", self.config.get("warmup_repeats", 1)))
-        for _ in range(max(warmup_repeats, 0)):
+        for index in range(max(warmup_repeats, 0)):
+            _log(f"[{adapter.name}] warmup {index + 1}/{warmup_repeats}...")
             with time_limit(_timeout_for(model_config, self.config)):
                 adapter.speed_once(warmup_text, int(self.config.get("decode_new_tokens", 32)))
 
@@ -245,6 +254,7 @@ class BenchmarkRunner:
         errors: list[dict[str, str]] = []
         for repeat_index in range(self.repeats):
             try:
+                _log(f"[{adapter.name}] speed bucket={bucket} repeat={repeat_index + 1}/{self.repeats}...")
                 with time_limit(_timeout_for(model_config, self.config)):
                     measurement = adapter.speed_once(
                         text,
@@ -253,6 +263,10 @@ class BenchmarkRunner:
                 measurement["repeat_index"] = repeat_index
                 measurements.append(measurement)
             except Exception as exc:
+                _log(
+                    f"[{adapter.name}] speed bucket={bucket} repeat={repeat_index + 1} "
+                    f"failed: {type(exc).__name__}: {exc}"
+                )
                 errors.append({"type": type(exc).__name__, "message": str(exc)})
                 if bool(model_config.get("stop_on_error", False)):
                     break
@@ -300,6 +314,7 @@ class BenchmarkRunner:
 
         for sample in selected:
             try:
+                _log(f"[{adapter.name}] quality sample={sample.id}...")
                 with time_limit(_timeout_for(model_config, self.config)):
                     started = time.perf_counter()
                     output = adapter.redact(sample.text)
@@ -311,6 +326,7 @@ class BenchmarkRunner:
                 anchor_total += score["anchor_total"]
                 anchor_keep += score["anchor_keep"]
             except Exception as exc:
+                _log(f"[{adapter.name}] quality sample={sample.id} failed: {type(exc).__name__}: {exc}")
                 errors.append({"sample_id": sample.id, "type": type(exc).__name__, "message": str(exc)})
 
         _write_jsonl(self.out_path, {
