@@ -12,6 +12,11 @@ hf = [
     "transformers>=4.40",
     "accelerate>=0.29",
 ]
+mlx = [
+    "mlx>=0.31.1; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings.git@ea6d739c73efe991239bc8596ebdfb7060ad209d ; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "opf @ git+https://github.com/openai/privacy-filter.git ; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
 opf = [
     "opf @ git+https://github.com/openai/privacy-filter.git",
 ]
@@ -31,4 +36,3 @@ packages = ["pii_benchmark"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-

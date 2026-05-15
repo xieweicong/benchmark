@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+is_valid_opf_checkpoint() {
+  local path="$1"
+  [[ -f "$path/config.json" ]]
+}
+
 MODE="${1:-smoke}"
 if [[ $# -gt 0 ]]; then
   shift
@@ -18,6 +23,10 @@ mkdir -p results
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEVICE="${DEVICE:-auto}"
 UV_PYTHON="${UV_PYTHON:-3.12}"
+IS_APPLE_SILICON=0
+if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+  IS_APPLE_SILICON=1
+fi
 QUALITY_ARGS=()
 EXTRAS=()
 RUN_ARGS=()
@@ -36,7 +45,7 @@ case "$MODE" in
     EXTRAS=(--extra opf --extra system)
     DEFAULT_OPF_CHECKPOINT="$HOME/Library/Application Support/PII Shield/model/privacy_filter"
     OPF_CHECKPOINT="${PII_BENCH_OPF_CHECKPOINT:-}"
-    if [[ -z "$OPF_CHECKPOINT" && -d "$DEFAULT_OPF_CHECKPOINT" ]]; then
+    if [[ -z "$OPF_CHECKPOINT" ]] && is_valid_opf_checkpoint "$DEFAULT_OPF_CHECKPOINT"; then
       OPF_CHECKPOINT="$DEFAULT_OPF_CHECKPOINT"
     fi
     if [[ -n "$OPF_CHECKPOINT" ]]; then
@@ -50,14 +59,27 @@ case "$MODE" in
     QUALITY_LIMIT="${QUALITY_LIMIT:-5}"
     EXTRAS=(--extra hf --extra system)
     ;;
-  all)
-    MODELS="${MODELS:-regex,opf}"
+  mlx)
+    MODELS="${MODELS:-${1:-mlx-opf-bf16}}"
     SIZES="${SIZES:-256,1024,4096}"
     REPEATS="${REPEATS:-3}"
-    EXTRAS=(--extra opf --extra system)
+    QUALITY_LIMIT="${QUALITY_LIMIT:-5}"
+    DEVICE="mps"
+    EXTRAS=(--extra mlx --extra system)
+    ;;
+  all)
+    if [[ "$IS_APPLE_SILICON" == "1" ]]; then
+      MODELS="${MODELS:-regex,opf,mlx-opf-bf16}"
+      EXTRAS=(--extra opf --extra hf --extra mlx --extra system)
+    else
+      MODELS="${MODELS:-regex,opf}"
+      EXTRAS=(--extra opf --extra hf --extra system)
+    fi
+    SIZES="${SIZES:-256,1024,4096}"
+    REPEATS="${REPEATS:-3}"
     DEFAULT_OPF_CHECKPOINT="$HOME/Library/Application Support/PII Shield/model/privacy_filter"
     OPF_CHECKPOINT="${PII_BENCH_OPF_CHECKPOINT:-}"
-    if [[ -z "$OPF_CHECKPOINT" && -d "$DEFAULT_OPF_CHECKPOINT" ]]; then
+    if [[ -z "$OPF_CHECKPOINT" ]] && is_valid_opf_checkpoint "$DEFAULT_OPF_CHECKPOINT"; then
       OPF_CHECKPOINT="$DEFAULT_OPF_CHECKPOINT"
     fi
     if [[ -n "$OPF_CHECKPOINT" ]]; then
@@ -65,7 +87,7 @@ case "$MODE" in
     fi
     ;;
   *)
-    echo "Usage: ./run.sh [smoke|opf|hf|all]" >&2
+    echo "Usage: ./run.sh [smoke|opf|hf|mlx|all]" >&2
     echo "Override with env vars: MODELS, SIZES, REPEATS, QUALITY_LIMIT, DEVICE, PII_BENCH_OPF_CHECKPOINT" >&2
     exit 2
     ;;

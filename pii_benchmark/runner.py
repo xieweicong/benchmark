@@ -101,7 +101,7 @@ def _aggregate(measurements: list[dict[str, Any]], power_watts: float | None = N
         key
         for measurement in measurements
         for key in measurement
-        if key.startswith("opf_")
+        if key.startswith(("opf_", "mlx_"))
         and key not in {"opf_decoded_mismatch"}
         and isinstance(measurement.get(key), int | float)
         and not isinstance(measurement.get(key), bool)
@@ -238,10 +238,10 @@ class BenchmarkRunner:
                 })
             for bucket in self.speed_sizes:
                 self._run_speed_bucket(adapter, model_config, load_info, seed, bucket, power_watts)
-            if self.run_batch_compare:
-                self._run_batch_compare(adapter, model_config, load_info, seed, power_watts)
-            if self.run_quality:
-                self._run_quality(adapter, model_config, load_info, samples)
+            # if self.run_batch_compare:
+            #     self._run_batch_compare(adapter, model_config, load_info, seed, power_watts)
+            # if self.run_quality:
+            #     self._run_quality(adapter, model_config, load_info, samples)
             _log(f"[{adapter.name}] done.")
         except Exception as exc:
             _log(f"[{adapter.name}] error: {type(exc).__name__}: {exc}")

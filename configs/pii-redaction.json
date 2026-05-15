@@ -33,6 +33,23 @@
       ]
     },
     {
+      "name": "mlx-opf-bf16",
+      "type": "mlx_token_classifier",
+      "enabled": false,
+      "model_id": "mlx-community/openai-privacy-filter-bf16",
+      "categories": [
+        "secret",
+        "account_number",
+        "private_email",
+        "private_phone",
+        "private_person",
+        "private_address",
+        "private_date",
+        "private_url"
+      ],
+      "timeout_s": 1200
+    },
+    {
       "name": "qwen3-0.8b",
       "type": "hf_causal_lm",
       "enabled": false,

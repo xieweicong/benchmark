@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import platform
 import re
 import shutil
 import time
@@ -48,6 +49,13 @@ class RedactionOutput:
     input_tokens: int | None = None
     output_tokens: int | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SpanMatch:
+    label: str
+    start: int
+    end: int
 
 
 class ModelAdapter:
@@ -594,6 +602,424 @@ class HFCausalLMAdapter(ModelAdapter):
         }
 
 
+class MLXTokenClassificationAdapter(ModelAdapter):
+    def __init__(self, config: dict[str, Any], device: str = "auto") -> None:
+        super().__init__(config, device)
+        self.model_id = str(config.get("model_id") or "mlx-community/openai-privacy-filter-bf16")
+        self.model: Any = None
+        self.tokenizer: Any = None
+        self.mx: Any = None
+        self.model_path: Any = None
+        self.id2label: dict[Any, Any] = {}
+        self.resolved_device = "mps"
+        self.categories = set(config.get("categories") or PII_CATEGORIES)
+        self.decode_mode = str(config.get("decode_mode") or "viterbi")
+        self.trim_whitespace = bool(config.get("trim_whitespace", True))
+        self.discard_overlapping_predicted_spans = bool(
+            config.get("discard_overlapping_predicted_spans", False)
+        )
+        self._torch: Any = None
+        self._decoder: Any = None
+        self._label_info: Any = None
+        self._opf_labels_to_spans: Any = None
+        self._opf_token_spans_to_char_spans: Any = None
+        self._opf_trim_char_spans_whitespace: Any = None
+        self._opf_discard_overlapping_spans_by_label: Any = None
+
+    def load(self) -> dict[str, Any]:
+        started = time.perf_counter()
+        if self.device not in {"auto", "mps"}:
+            raise ValueError("MLX adapter supports only `auto` or `mps` devices.")
+        if platform.system() != "Darwin" or platform.machine().lower() not in {"arm64", "aarch64"}:
+            raise RuntimeError("MLX adapter requires macOS on Apple Silicon.")
+
+        try:
+            import mlx.core as mx  # type: ignore
+            from mlx_embeddings.utils import get_model_path, load as load_mlx  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("MLX adapter requires `pip install .[mlx]` on Apple Silicon.") from exc
+
+        self.mx = mx
+        self.model, self.tokenizer = load_mlx(self.model_id)
+        self.model_path = get_model_path(self.model_id)
+        config = getattr(self.model, "config", None)
+        self.id2label = dict(getattr(config, "id2label", {}) or {})
+        self._load_decoder_support()
+        self.resolved_device = "mps"
+        return {
+            "load_s": time.perf_counter() - started,
+            "device": self.resolved_device,
+            "model_id": self.model_id,
+            "decode_mode": self.decode_mode,
+        }
+
+    def _load_decoder_support(self) -> None:
+        if not self.id2label:
+            return
+        class_names = [_lookup_label(self.id2label, index) for index in range(len(self.id2label))]
+        if self.decode_mode == "argmax":
+            return
+        try:
+            import torch  # type: ignore
+            from opf._core.decoding import build_sequence_decoder  # type: ignore
+            from opf._core.sequence_labeling import build_label_info  # type: ignore
+            from opf._core.spans import (  # type: ignore
+                discard_overlapping_spans_by_label,
+                labels_to_spans,
+                token_spans_to_char_spans,
+                trim_char_spans_whitespace,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "MLX Viterbi decode requires OPF helpers; install `pip install .[mlx]`."
+            ) from exc
+
+        self._torch = torch
+        self._label_info = build_label_info(class_names)
+        self._decoder, _ = build_sequence_decoder(
+            decode_mode=self.decode_mode,
+            label_info=self._label_info,
+            viterbi_calibration_path=self.config.get("viterbi_calibration_path"),
+            checkpoint_dir=str(self.model_path) if self.model_path else None,
+        )
+        self._opf_labels_to_spans = labels_to_spans
+        self._opf_token_spans_to_char_spans = token_spans_to_char_spans
+        self._opf_trim_char_spans_whitespace = trim_char_spans_whitespace
+        self._opf_discard_overlapping_spans_by_label = discard_overlapping_spans_by_label
+
+    def close(self) -> None:
+        self.model = None
+        self.tokenizer = None
+        gc.collect()
+        if self.mx is not None:
+            clear_cache = getattr(self.mx, "clear_cache", None)
+            if callable(clear_cache):
+                clear_cache()
+                return
+            metal = getattr(self.mx, "metal", None)
+            clear_cache = getattr(metal, "clear_cache", None)
+            if callable(clear_cache):
+                clear_cache()
+
+    def redact(self, text: str) -> RedactionOutput:
+        if self.model is None or self.tokenizer is None:
+            self.load()
+
+        metrics: dict[str, Any] = {
+            "mlx_tokenize_s": 0.0,
+            "mlx_model_forward_s": 0.0,
+            "mlx_decode_s": 0.0,
+            "mlx_offsets_s": 0.0,
+            "mlx_span_postprocess_s": 0.0,
+            "mlx_redaction_s": 0.0,
+        }
+
+        total_started = time.perf_counter()
+
+        stage_started = time.perf_counter()
+        offset_mapping = None
+        try:
+            inputs = self.tokenizer(text, return_tensors="mlx", return_offsets_mapping=True)
+            offset_mapping = _coerce_offset_mapping(inputs.get("offset_mapping"))
+        except Exception:
+            inputs = self.tokenizer(text, return_tensors="mlx")
+        metrics["mlx_tokenize_s"] = time.perf_counter() - stage_started
+
+        token_ids = _coerce_token_ids(inputs.get("input_ids"))
+        attention_mask = inputs.get("attention_mask")
+        input_tokens = _attention_token_count(attention_mask, fallback=len(token_ids))
+
+        stage_started = time.perf_counter()
+        outputs = self.model(inputs["input_ids"], attention_mask=attention_mask)
+        logits = outputs.logits
+        self.mx.eval(logits)
+        metrics["mlx_model_forward_s"] = time.perf_counter() - stage_started
+
+        stage_started = time.perf_counter()
+        pred_ids = self._decode_predictions(logits)
+        metrics["mlx_decode_s"] = time.perf_counter() - stage_started
+
+        if offset_mapping is None:
+            stage_started = time.perf_counter()
+            offset_inputs = self.tokenizer(text, return_offsets_mapping=True)
+            offset_mapping = _coerce_offset_mapping(offset_inputs.get("offset_mapping"))
+            metrics["mlx_offsets_s"] = time.perf_counter() - stage_started
+
+        stage_started = time.perf_counter()
+        spans = self._spans_from_predictions(text, offset_mapping, token_ids, pred_ids)
+        if not spans:
+            labels = [_lookup_label(self.id2label, pred_id) for pred_id in pred_ids]
+            spans = _fallback_spans_from_decoded_tokens(
+                text,
+                token_ids,
+                labels,
+                tokenizer=self.tokenizer,
+                allowed_labels=self.categories,
+            )
+        metrics["mlx_span_postprocess_s"] = time.perf_counter() - stage_started
+
+        stage_started = time.perf_counter()
+        redacted = _apply_spans(text, spans)
+        metrics["mlx_redaction_s"] = time.perf_counter() - stage_started
+        metrics["latency_s"] = time.perf_counter() - total_started
+        metrics["spans"] = len(spans)
+
+        return RedactionOutput(
+            text=redacted,
+            input_tokens=input_tokens,
+            output_tokens=token_count(redacted),
+            metrics=metrics,
+        )
+
+    def _decode_predictions(self, logits: Any) -> list[int]:
+        sequence_logits = logits[0].astype(self.mx.float32)
+        if self._decoder is None or self._torch is None:
+            preds = self.mx.argmax(sequence_logits, axis=-1)
+            self.mx.eval(preds)
+            return _coerce_token_ids(preds)
+
+        try:
+            import numpy as np  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("MLX Viterbi decode requires numpy.") from exc
+
+        log_probs = sequence_logits - self.mx.logsumexp(sequence_logits, axis=-1, keepdims=True)
+        self.mx.eval(log_probs)
+        torch_scores = self._torch.from_numpy(np.array(log_probs, copy=False)).to(
+            dtype=self._torch.float32
+        )
+        decoded = self._decoder.decode(torch_scores)
+        return [int(label) for label in decoded]
+
+    def _spans_from_predictions(
+        self,
+        text: str,
+        offset_mapping: list[tuple[int, int]],
+        token_ids: list[int],
+        pred_ids: list[int],
+    ) -> list[SpanMatch]:
+        if (
+            self._label_info is None
+            or self._opf_labels_to_spans is None
+            or self._opf_token_spans_to_char_spans is None
+        ):
+            labels = [_lookup_label(self.id2label, pred_id) for pred_id in pred_ids]
+            return _spans_from_bioes_offsets(offset_mapping, labels, allowed_labels=self.categories)
+
+        labels_by_index = {index: int(label) for index, label in enumerate(pred_ids)}
+        token_spans = self._opf_labels_to_spans(labels_by_index, self._label_info)
+        char_starts = [int(start) for start, _end in offset_mapping[: len(token_ids)]]
+        char_ends = [int(end) for _start, end in offset_mapping[: len(token_ids)]]
+        char_spans = self._opf_token_spans_to_char_spans(token_spans, char_starts, char_ends)
+        if self.trim_whitespace and self._opf_trim_char_spans_whitespace is not None:
+            char_spans = self._opf_trim_char_spans_whitespace(char_spans, text)
+        if (
+            self.discard_overlapping_predicted_spans
+            and self._opf_discard_overlapping_spans_by_label is not None
+        ):
+            char_spans = self._opf_discard_overlapping_spans_by_label(char_spans)
+
+        spans: list[SpanMatch] = []
+        for label_idx, start, end in char_spans:
+            if not (0 <= int(start) < int(end) <= len(text)):
+                continue
+            label = (
+                str(self._label_info.span_class_names[label_idx])
+                if 0 <= int(label_idx) < len(self._label_info.span_class_names)
+                else f"label_{label_idx}"
+            )
+            if label not in self.categories:
+                continue
+            spans.append(SpanMatch(label=label, start=int(start), end=int(end)))
+        return spans
+
+
+def _lookup_label(id2label: dict[Any, Any], prediction: int) -> str:
+    label = id2label.get(prediction)
+    if label is None:
+        label = id2label.get(str(prediction))
+    return str(label or "O")
+
+
+def _entity_name(label: str) -> str | None:
+    _tag, entity = _split_bioes_label(label)
+    return entity
+
+
+def _split_bioes_label(label: str) -> tuple[str | None, str | None]:
+    if label == "O":
+        return None, None
+    prefix, sep, entity = label.partition("-")
+    prefix = prefix.upper()
+    if sep and prefix in {"B", "I", "E", "S"}:
+        return prefix, entity
+    return "S", label
+
+
+def _coerce_token_ids(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not value:
+        return []
+    if isinstance(value[0], list):
+        value = value[0]
+    return [int(token_id) for token_id in value]
+
+
+def _coerce_offset_mapping(value: Any) -> list[tuple[int, int]]:
+    if value is None:
+        return []
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not value:
+        return []
+    if isinstance(value[0], list) and value[0] and isinstance(value[0][0], list | tuple):
+        value = value[0]
+    offsets: list[tuple[int, int]] = []
+    for item in value:
+        if not isinstance(item, list | tuple) or len(item) < 2:
+            continue
+        offsets.append((int(item[0]), int(item[1])))
+    return offsets
+
+
+def _attention_token_count(attention_mask: Any, fallback: int) -> int:
+    if attention_mask is None:
+        return fallback
+    if hasattr(attention_mask, "tolist"):
+        attention_mask = attention_mask.tolist()
+    if not attention_mask:
+        return fallback
+    if isinstance(attention_mask[0], list):
+        attention_mask = attention_mask[0]
+    return sum(int(value) for value in attention_mask)
+
+
+def _spans_from_bioes_offsets(
+    offsets: list[tuple[int, int]],
+    labels: list[str],
+    allowed_labels: set[str] | None = None,
+) -> list[SpanMatch]:
+    spans: list[SpanMatch] = []
+    current_label: str | None = None
+    current_start: int | None = None
+    current_end: int | None = None
+
+    def flush() -> None:
+        nonlocal current_label, current_start, current_end
+        if (
+            current_label is not None
+            and current_start is not None
+            and current_end is not None
+            and current_start < current_end
+            and (allowed_labels is None or current_label in allowed_labels)
+        ):
+            spans.append(SpanMatch(label=current_label, start=current_start, end=current_end))
+        current_label = None
+        current_start = None
+        current_end = None
+
+    for offset, label in zip(offsets, labels):
+        start, end = int(offset[0]), int(offset[1])
+        if start >= end:
+            continue
+
+        tag, entity = _split_bioes_label(label)
+        if entity is None:
+            flush()
+            continue
+
+        if tag == "S":
+            flush()
+            if allowed_labels is None or entity in allowed_labels:
+                spans.append(SpanMatch(label=entity, start=start, end=end))
+            continue
+
+        if tag == "B":
+            flush()
+            current_label = entity
+            current_start = start
+            current_end = end
+            continue
+
+        if tag == "I":
+            if current_label == entity and current_start is not None:
+                current_end = max(int(current_end or end), end)
+            else:
+                flush()
+                current_label = entity
+                current_start = start
+                current_end = end
+            continue
+
+        if tag == "E":
+            if current_label == entity and current_start is not None:
+                current_end = max(int(current_end or end), end)
+                flush()
+            elif allowed_labels is None or entity in allowed_labels:
+                spans.append(SpanMatch(label=entity, start=start, end=end))
+            continue
+
+        flush()
+
+    flush()
+    return spans
+
+
+def _fallback_spans_from_decoded_tokens(
+    text: str,
+    token_ids: list[int],
+    labels: list[str],
+    tokenizer: Any,
+    allowed_labels: set[str] | None = None,
+) -> list[SpanMatch]:
+    spans: list[SpanMatch] = []
+    search_from = 0
+    group_label: str | None = None
+    group_tokens: list[int] = []
+
+    def flush() -> None:
+        nonlocal group_label, group_tokens, search_from
+        if group_label is None or not group_tokens:
+            group_label = None
+            group_tokens = []
+            return
+
+        label = group_label
+        decoded = str(tokenizer.decode(group_tokens)).strip()
+        group_label = None
+        group_tokens = []
+        if not decoded:
+            return
+
+        start = text.find(decoded, search_from)
+        if start < 0:
+            start = text.find(decoded)
+        if start < 0:
+            return
+
+        end = start + len(decoded)
+        search_from = end
+        spans.append(SpanMatch(label=label, start=start, end=end))
+
+    for token_id, label in zip(token_ids, labels):
+        entity = _entity_name(label)
+        if entity is None or (allowed_labels is not None and entity not in allowed_labels):
+            flush()
+            continue
+        if group_label == entity:
+            group_tokens.append(token_id)
+            continue
+        flush()
+        group_label = entity
+        group_tokens = [token_id]
+
+    flush()
+    return spans
+
+
 def _apply_spans(text: str, spans: list[Any]) -> str:
     counters: dict[str, int] = {}
     redacted = text
@@ -693,4 +1119,6 @@ def build_adapter(config: dict[str, Any], device: str = "auto") -> ModelAdapter:
         return OPFAdapter(config, device=device)
     if adapter_type == "hf_causal_lm":
         return HFCausalLMAdapter(config, device=device)
+    if adapter_type == "mlx_token_classifier":
+        return MLXTokenClassificationAdapter(config, device=device)
     raise ValueError(f"Unsupported model adapter type: {adapter_type}")

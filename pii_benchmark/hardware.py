@@ -254,6 +254,8 @@ def capture_metadata(root: str | Path) -> dict[str, Any]:
         "packages": {
             "torch": _package_version("torch"),
             "transformers": _package_version("transformers"),
+            "mlx": _package_version("mlx"),
+            "mlx_embeddings": _package_version("mlx-embeddings"),
             "opf": _package_version("opf"),
             "psutil": _package_version("psutil"),
         },

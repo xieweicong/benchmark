@@ -2,6 +2,9 @@
 
 Portable benchmark harness for local PII redaction models. It is designed to run on a laptop, an on-prem box, or a rented cloud GPU instance, then emit portable JSONL results that can be merged into one report.
 
+Implementation notes for the MLX privacy-filter path live in `docs/mlx-integration-notes.md`.
+The final optimized setup and benchmark summary live in `docs/mlx-final-optimization-summary.md`.
+
 ## What It Measures
 
 - Hardware and software metadata: OS, Python, CPU, RAM, GPU, CUDA/MPS, package versions, git commit.
@@ -51,11 +54,21 @@ Run a Hugging Face causal LM locally:
 ./run.sh hf qwen3-0.8b
 ```
 
+Run the MLX privacy-filter baseline locally on Apple Silicon:
+
+```bash
+./run.sh mlx
+```
+
+The MLX path now uses OPF-compatible Viterbi decoding and span post-processing so its redacted output matches the OPF baseline on the local dataset.
+
 By default, `./run.sh opf` automatically uses the PII Shield checkpoint at:
 
 ```text
 ~/Library/Application Support/PII Shield/model/privacy_filter
 ```
+
+If that directory exists but is incomplete, such as missing `config.json`, the runner ignores it and falls back to the benchmark-managed OPF checkpoint auto-download.
 
 Override defaults with env vars:
 
@@ -63,6 +76,7 @@ Override defaults with env vars:
 SIZES=256,1024 REPEATS=5 DEVICE=mps ./run.sh opf
 PII_BENCH_OPF_CHECKPOINT=/path/to/privacy_filter ./run.sh opf
 MODELS=qwen3-1.7b DEVICE=cuda ./run.sh hf
+MODELS=mlx-opf-bf16 ./run.sh mlx
 ```
 
 Add a power budget to get `tok/s/W`:
@@ -165,6 +179,8 @@ Run a Hugging Face baseline. Missing `torch`/`transformers` dependencies are aut
 ./run.sh hf qwen3-0.8b
 ```
 
+The MLX baseline is intended for local macOS/Apple Silicon runs and is not supported in Kaggle, Docker CUDA, or Jetson flows.
+
 Disable auto-install if you want to manage the environment yourself:
 
 ```bash
@@ -248,7 +264,7 @@ Default config lives at `configs/pii-redaction.json`.
 Models are selected by `name`, `type`, or HF `model_id`:
 
 ```bash
-python -m pii_benchmark.cli run --models regex,opf
+python -m pii_benchmark.cli run --models regex,opf,mlx-opf-bf16
 ```
 
 Disabled models in the config are skipped by default, but can still be selected explicitly:
@@ -262,6 +278,9 @@ python -m pii_benchmark.cli run --models qwen3-1.7b
 - Dataset samples are synthetic and local.
 - The dependency-free token counter is a stable benchmark bucket, not a model tokenizer clone.
 - HF adapters also report model tokenizer input length for speed rows.
+- The MLX adapter uses `mlx-embeddings` with `mlx-community/openai-privacy-filter-bf16` and is limited to macOS Apple Silicon (`DEVICE=mps`).
+- The required `openai/privacy-filter` support is currently installed from the `mlx-embeddings` GitHub repository rather than the older PyPI release.
+- The optimized MLX path uses OPF decoding helpers for Viterbi/span reconstruction, so the `mlx` extra also installs `opf`.
 - Use Docker for Linux/NVIDIA cloud GPUs.
 - Use `uv` for local Mac/Apple Silicon because Docker does not give a realistic MPS benchmark.
 - Python 3.12 is recommended for local OPF runs. Override the uv interpreter with `UV_PYTHON=3.11` or `UV_PYTHON=3.12.11`.
